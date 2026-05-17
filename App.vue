@@ -4,7 +4,7 @@ import { ref, computed, onMounted } from 'vue'
 // =========================================================================
 // types
 // =========================================================================
-type Status = 'pending' | 'picked' | 'done' | 'rejected'
+type Status = 'pending' | 'picked' | 'ready' | 'done' | 'rejected'
 
 interface WishItem {
   id: number
@@ -137,16 +137,33 @@ async function deleteItem(id: number) {
 
 async function patchStatus(id: number, status: Status) {
   try {
-    await fetch(`/api/wishlist/${id}`, {
+    const r = await fetch(`/api/wishlist/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
       body: JSON.stringify({ status }),
     })
+    if (!r.ok) {
+      const d = await r.json().catch(() => null)
+      throw new Error(d?.statusMessage || `HTTP ${r.status}`)
+    }
     await loadItems()
   } catch (e: any) {
     errorMsg.value = '更新失敗：' + (e?.message || e)
   }
+}
+
+// admin dropdown 觸發 — 雙保險再 confirm 一次「降級」操作 (done → 其他)
+async function onStatusChange(id: number, next: Status) {
+  const cur = items.value.find(i => i.id === id)
+  if (!cur || cur.status === next) return
+  if (cur.status === 'done' && next !== 'done') {
+    if (!confirm(`要把已完成的「${cur.title}」改回「${STATUS_LABEL[next]}」嗎？`)) {
+      await loadItems()  // 強制 dropdown 顯示回原本值
+      return
+    }
+  }
+  await patchStatus(id, next)
 }
 
 // =========================================================================
@@ -204,15 +221,15 @@ async function execute() {
 
 async function approveExec() {
   if (!currentExec.value) return
-  if (!confirm('確認 prompt 沒問題 → 這批 items 會標記為 done。')) return
+  if (!confirm('確認 prompt 沒問題 → 這批 items 會轉為「待 Claude 接手」(ready) 狀態。')) return
   try {
     await fetch(`/api/admin/wishlist/executions/${currentExec.value.id}/approve`, {
       method: 'POST', credentials: 'include',
     })
     currentExec.value.status = 'approved'
     await loadItems()
-    okMsg.value = '✓ 已確認，items 狀態已轉為 done。記得把 prompt 複製給 Claude Code 執行。'
-    setTimeout(() => { okMsg.value = '' }, 5000)
+    okMsg.value = '✓ 已確認，items 轉為 ready (等 Claude 接手)。複製下方 prompt 給 Claude Code 跑；Claude 做完後請手動把 status 改成 done。'
+    setTimeout(() => { okMsg.value = '' }, 8000)
   } catch (e: any) {
     errorMsg.value = '確認失敗：' + (e?.message || e)
   }
@@ -240,9 +257,11 @@ function closeExec() {
 const STATUS_LABEL: Record<Status, string> = {
   pending: '待處理',
   picked:  '已挑選',
+  ready:   '待 Claude 接手',
   done:    '已完成',
   rejected:'已拒絕',
 }
+const STATUS_ORDER: Status[] = ['pending', 'picked', 'ready', 'done', 'rejected']
 
 function targetLabel(it: WishItem): string {
   if (it.proposed_new_slug) return `新建：${it.proposed_new_slug}`
@@ -370,8 +389,26 @@ onMounted(() => {
             </div>
             <p v-if="it.description" class="desc">{{ it.description }}</p>
             <div class="item-actions">
-              <button v-if="isAdmin && it.status !== 'rejected'" class="mini" @click="patchStatus(it.id, 'rejected')">拒絕</button>
-              <button v-if="isAdmin && it.status === 'rejected'" class="mini" @click="patchStatus(it.id, 'pending')">回 pending</button>
+              <!-- admin: 任意改 status (狀態修正) -->
+              <label v-if="isAdmin" class="status-edit">
+                <span>狀態</span>
+                <select :value="it.status" @change="onStatusChange(it.id, ($event.target as HTMLSelectElement).value as Status)">
+                  <option v-for="s in STATUS_ORDER" :key="s" :value="s">{{ STATUS_LABEL[s] }}</option>
+                </select>
+              </label>
+              <!-- admin 快捷：把 pending / picked 直接「啟動」轉 ready -->
+              <button
+                v-if="isAdmin && (it.status === 'pending' || it.status === 'picked')"
+                class="mini accent"
+                title="跳過 gemma 產 prompt，直接標記為等 Claude 接手"
+                @click="patchStatus(it.id, 'ready')"
+              >✓ 啟動自動編寫</button>
+              <!-- admin 快捷：標記 Claude 已做完 -->
+              <button
+                v-if="isAdmin && it.status === 'ready'"
+                class="mini"
+                @click="patchStatus(it.id, 'done')"
+              >Claude 已完成 → done</button>
               <button class="mini danger" @click="deleteItem(it.id)">刪除</button>
             </div>
           </div>
@@ -537,6 +574,7 @@ h2 { margin: 0; font-weight: 600; letter-spacing: .5px; }
 }
 .b-pending  { color: #f0d97a; }
 .b-picked   { color: #82e7a8; }
+.b-ready    { color: #7ab8ff; }
 .b-done     { color: var(--tx-3, #888); }
 .b-rejected { color: #ff8888; }
 
@@ -568,6 +606,20 @@ h2 { margin: 0; font-weight: 600; letter-spacing: .5px; }
 .mini:hover { color: var(--tx-1); border-color: var(--line-3); }
 .mini.danger { color: #ff8888; border-color: rgba(255,136,136,.4); }
 .mini.danger:hover { background: rgba(255,136,136,.1); }
+.mini.accent { color: #7ab8ff; border-color: rgba(122,184,255,.5); }
+.mini.accent:hover { background: rgba(122,184,255,.12); border-color: rgba(122,184,255,.8); }
+
+.status-edit { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--tx-3, #888); }
+.status-edit > span { letter-spacing: .5px; }
+.status-edit select {
+  background: var(--bg-input, #0e0e0e);
+  border: 1px solid var(--line-2, rgba(255,255,255,.12));
+  color: var(--tx-1, #eee);
+  font: inherit; font-size: 12px;
+  padding: 3px 8px; border-radius: 4px;
+  outline: none; cursor: pointer;
+}
+.status-edit select:focus { border-color: var(--tx-2, #aaa); }
 
 /* ---------------- modal ---------------- */
 .modal-mask {
