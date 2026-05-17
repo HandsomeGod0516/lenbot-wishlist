@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 
 // =========================================================================
 // types
 // =========================================================================
 type Status = 'pending' | 'picked' | 'ready' | 'done' | 'rejected'
+type ExecStatus = 'draft' | 'approved' | 'running' | 'done' | 'failed'
 
 interface WishItem {
   id: number
@@ -25,9 +26,13 @@ interface Project { slug: string; name: string; description: string }
 interface Execution {
   id: number
   generated_prompt: string
-  status: 'draft' | 'approved' | 'done'
+  status: ExecStatus
   approved_at: string | null
   created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  error_message?: string | null
+  pid?: number | null
 }
 
 // =========================================================================
@@ -56,6 +61,11 @@ const extraNote = ref('')
 // admin 看 prompt
 const currentExec = ref<Execution | null>(null)
 const promptCopied = ref(false)
+
+// 由 Claude 完成 (背景跑 + 輪詢)
+const dispatching = ref(false)
+const logTail = ref('')
+let pollTimer: ReturnType<typeof setInterval> | null = null
 
 // =========================================================================
 // load
@@ -228,10 +238,84 @@ async function approveExec() {
     })
     currentExec.value.status = 'approved'
     await loadItems()
-    okMsg.value = '✓ 已確認，items 轉為 ready (等 Claude 接手)。複製下方 prompt 給 Claude Code 跑；Claude 做完後請手動把 status 改成 done。'
-    setTimeout(() => { okMsg.value = '' }, 8000)
+    okMsg.value = '✓ 已確認。可按「由 Claude 完成」自動跑，或自己複製 prompt 貼到別的 Claude Code 視窗。'
+    setTimeout(() => { okMsg.value = '' }, 6000)
   } catch (e: any) {
     errorMsg.value = '確認失敗：' + (e?.message || e)
+  }
+}
+
+// 按「由 Claude 完成」→ 後端 spawn claude -p，前端輪詢狀態 + log tail
+async function dispatchExec() {
+  if (!currentExec.value) return
+  if (currentExec.value.status !== 'approved') return
+  if (!confirm('要由 Claude 自動執行這份 prompt 嗎？\n(會在 server 上跑 claude -p，可能要數分鐘)')) return
+  dispatching.value = true
+  errorMsg.value = ''
+  logTail.value = ''
+  try {
+    const r = await fetch(`/api/admin/wishlist/executions/${currentExec.value.id}/dispatch`, {
+      method: 'POST', credentials: 'include',
+    })
+    if (!r.ok && r.status !== 202) {
+      const d = await r.json().catch(() => null)
+      throw new Error(d?.statusMessage || `HTTP ${r.status}`)
+    }
+    currentExec.value.status = 'running'
+    currentExec.value.started_at = new Date().toISOString()
+    startPoll()
+  } catch (e: any) {
+    errorMsg.value = '由 Claude 執行失敗：' + (e?.message || e)
+  } finally {
+    dispatching.value = false
+  }
+}
+
+function startPoll() {
+  stopPoll()
+  pollTimer = setInterval(pollExec, 3000)
+  // 第一輪馬上跑一次，不用等 3s
+  pollExec()
+}
+
+function stopPoll() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+async function pollExec() {
+  if (!currentExec.value) { stopPoll(); return }
+  const id = currentExec.value.id
+  try {
+    const [execR, logR] = await Promise.all([
+      fetch(`/api/admin/wishlist/executions/${id}`, { credentials: 'include' }),
+      fetch(`/api/admin/wishlist/executions/${id}/log`, { credentials: 'include' }),
+    ])
+    if (execR.ok) {
+      const d = await execR.json()
+      if (d.execution && currentExec.value && currentExec.value.id === id) {
+        currentExec.value.status        = d.execution.status
+        currentExec.value.started_at    = d.execution.started_at
+        currentExec.value.finished_at   = d.execution.finished_at
+        currentExec.value.error_message = d.execution.error_message
+      }
+    }
+    if (logR.ok) {
+      const d = await logR.json()
+      logTail.value = d.tail || ''
+    }
+    if (currentExec.value && (currentExec.value.status === 'done' || currentExec.value.status === 'failed')) {
+      stopPoll()
+      await loadItems()
+      if (currentExec.value.status === 'done') {
+        okMsg.value = '✓ Claude 已完成這批願望 — items 自動轉為 done。'
+        setTimeout(() => { okMsg.value = '' }, 8000)
+      }
+    }
+  } catch {
+    // network blip — 下一輪再試
   }
 }
 
@@ -247,9 +331,13 @@ async function copyPrompt() {
 }
 
 function closeExec() {
+  stopPoll()
   currentExec.value = null
   promptCopied.value = false
+  logTail.value = ''
 }
+
+onUnmounted(stopPoll)
 
 // =========================================================================
 // util
@@ -428,13 +516,34 @@ onMounted(() => {
           <button class="close" @click="closeExec">✕</button>
         </header>
         <pre class="prompt"><code>{{ currentExec.generated_prompt }}</code></pre>
+
         <div v-if="currentExec.status === 'approved'" class="approved-hint">
-          ✓ 已確認 — 把上面 prompt 複製貼進 Claude Code (一個視窗開在 LenFirstWeb/ 底下)，Claude 會直接改檔 + git commit + push。
+          ✓ 已確認 — 按下方「由 Claude 完成」直接讓 server 上的 claude -p 自動跑，或自己複製 prompt 貼到別的 Claude Code 視窗。
         </div>
+        <div v-if="currentExec.status === 'running'" class="running-hint">
+          <span class="spin">⟳</span>
+          Claude 執行中…（PID {{ currentExec.pid || '?' }}，每 3 秒更新）
+        </div>
+        <div v-if="currentExec.status === 'done'" class="done-hint">
+          ✓ Claude 已完成 — 對應 items 已自動標為 done。
+        </div>
+        <div v-if="currentExec.status === 'failed'" class="failed-hint">
+          ✗ Claude 執行失敗：{{ currentExec.error_message || '(無詳細)' }}
+        </div>
+
+        <pre v-if="(currentExec.status === 'running' || currentExec.status === 'failed') && logTail"
+             class="logtail"><code>{{ logTail }}</code></pre>
+
         <footer class="modal-foot">
           <button class="btn-ghost" @click="copyPrompt">{{ promptCopied ? '✓ 已複製' : '複製到剪貼簿' }}</button>
           <span class="spacer" />
           <button v-if="currentExec.status === 'draft'" class="btn-primary" @click="approveExec">確認執行</button>
+          <button
+            v-if="currentExec.status === 'approved'"
+            class="btn-primary"
+            :disabled="dispatching"
+            @click="dispatchExec"
+          >{{ dispatching ? '啟動中…' : '▶ 由 Claude 完成' }}</button>
           <button class="btn-ghost" @click="closeExec">關閉</button>
         </footer>
       </div>
@@ -659,12 +768,34 @@ h2 { margin: 0; font-weight: 600; letter-spacing: .5px; }
   font: 13px/1.6 ui-monospace, "JetBrains Mono", Menlo, monospace;
   white-space: pre-wrap;
 }
-.approved-hint {
+.approved-hint,
+.running-hint,
+.done-hint,
+.failed-hint {
   padding: 12px 22px;
-  background: rgba(130,231,168,.07);
-  border-top: 1px solid rgba(130,231,168,.2);
-  color: #82e7a8;
+  border-top: 1px solid;
   font-size: 13px;
+  display: flex; align-items: center; gap: 8px;
+}
+.approved-hint { background: rgba(130,231,168,.07); border-top-color: rgba(130,231,168,.2); color: #82e7a8; }
+.running-hint  { background: rgba(122,184,255,.08); border-top-color: rgba(122,184,255,.25); color: #7ab8ff; }
+.done-hint     { background: rgba(130,231,168,.10); border-top-color: rgba(130,231,168,.3);  color: #82e7a8; }
+.failed-hint   { background: rgba(255,136,136,.08); border-top-color: rgba(255,136,136,.25); color: #ff8888; }
+.spin {
+  display: inline-block;
+  animation: spin 1.2s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.logtail {
+  margin: 0;
+  padding: 12px 22px;
+  max-height: 220px;
+  overflow: auto;
+  background: #050505;
+  color: #b9b9b9;
+  font: 12px/1.55 ui-monospace, "JetBrains Mono", Menlo, monospace;
+  white-space: pre-wrap;
+  border-top: 1px solid var(--line-1);
 }
 .modal-foot {
   display: flex; align-items: center; gap: 10px;
