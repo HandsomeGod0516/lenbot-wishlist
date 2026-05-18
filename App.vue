@@ -194,7 +194,7 @@ async function execute() {
     errorMsg.value = '請先勾選至少一條願望'
     return
   }
-  if (!confirm(`要把 ${pickedCount.value} 條願望丟給 gemma4:31b 產 prompt 嗎？\n(會把這些 items 狀態改為 picked，並建立一筆 execution 記錄)`)) return
+  if (!confirm(`要把 ${pickedCount.value} 條願望丟給 Ollama 產 prompt 嗎？\n(會把這些 items 狀態改為 picked，並建立一筆 execution 記錄)`)) return
   executing.value = true
   errorMsg.value = ''
   try {
@@ -447,7 +447,7 @@ onMounted(() => {
       <div v-if="isAdmin" class="batch-bar">
         <div class="batch-info">
           已勾選 <strong>{{ pickedCount }}</strong> 條
-          <span v-if="pickedCount">— 將丟給 gemma4:31b 產 prompt</span>
+          <span v-if="pickedCount">— 將丟給 Ollama 產 prompt</span>
         </div>
         <input v-model="extraNote" class="batch-note" placeholder="(可選) 給 Claude 的補充指示…" />
         <button class="btn-primary" :disabled="!pickedCount || executing" @click="execute">
@@ -511,7 +511,7 @@ onMounted(() => {
           <div>
             <p class="kicker">EXECUTION · #{{ currentExec.id }}</p>
             <h3>給 Claude 的 prompt</h3>
-            <p class="sub">由 gemma4:31b 產出，請先過目；確認 OK 後複製給 Claude Code 執行</p>
+            <p class="sub">由本地模型產出，請先過目；確認 OK 後複製給 Claude Code 執行</p>
           </div>
           <button class="close" @click="closeExec">✕</button>
         </header>
