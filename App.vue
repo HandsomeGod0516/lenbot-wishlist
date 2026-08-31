@@ -23,9 +23,18 @@ interface WishItem {
 
 interface Project { slug: string; name: string; description: string }
 
+/** 產這份 prompt 的使用者原文（未經 gemma 改寫） */
+interface ExecSource {
+  id: number
+  by: string
+  title: string
+  description: string | null
+}
+
 interface Execution {
   id: number
   generated_prompt: string
+  sources?: ExecSource[]
   status: ExecStatus
   approved_at: string | null
   created_at: string
@@ -61,6 +70,9 @@ const extraNote = ref('')
 // admin 看 prompt
 const currentExec = ref<Execution | null>(null)
 const promptCopied = ref(false)
+// 送出前 admin 可以改：這份才是 claude 真正會跑的內容
+const promptDraft = ref('')
+const showSources = ref(true)
 
 // 由 Claude 完成 (背景跑 + 輪詢)
 const dispatching = ref(false)
@@ -215,10 +227,13 @@ async function execute() {
     currentExec.value = {
       id: d.executionId,
       generated_prompt: d.prompt,
+      sources: d.sources || [],
       status: 'draft',
       approved_at: null,
       created_at: new Date().toISOString(),
     }
+    promptDraft.value = d.prompt
+    showSources.value = true
     picked.value = new Set()
     extraNote.value = ''
     await loadItems()
@@ -231,11 +246,24 @@ async function execute() {
 
 async function approveExec() {
   if (!currentExec.value) return
-  if (!confirm('確認 prompt 沒問題 → 這批 items 會轉為「待 Claude 接手」(ready) 狀態。')) return
+  const edited = promptDraft.value.trim()
+  if (!edited) {
+    errorMsg.value = 'prompt 不能是空的'
+    return
+  }
+  if (!confirm('確認這份 prompt 沒問題 → 這批 items 會轉為「待 Claude 接手」(ready) 狀態。\n\n送出後這份內容就是 server 上 claude 實際會執行的指令。')) return
   try {
-    await fetch(`/api/admin/wishlist/executions/${currentExec.value.id}/approve`, {
-      method: 'POST', credentials: 'include',
+    const r = await fetch(`/api/admin/wishlist/executions/${currentExec.value.id}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ prompt: edited }),
     })
+    if (!r.ok) {
+      const d = await r.json().catch(() => null)
+      throw new Error(d?.statusMessage || `HTTP ${r.status}`)
+    }
+    currentExec.value.generated_prompt = edited
     currentExec.value.status = 'approved'
     await loadItems()
     okMsg.value = '✓ 已確認。可按「由 Claude 完成」自動跑，或自己複製 prompt 貼到別的 Claude Code 視窗。'
@@ -322,7 +350,9 @@ async function pollExec() {
 async function copyPrompt() {
   if (!currentExec.value) return
   try {
-    await navigator.clipboard.writeText(currentExec.value.generated_prompt)
+    await navigator.clipboard.writeText(
+      currentExec.value.status === 'draft' ? promptDraft.value : currentExec.value.generated_prompt,
+    )
     promptCopied.value = true
     setTimeout(() => { promptCopied.value = false }, 1500)
   } catch {
@@ -334,6 +364,7 @@ function closeExec() {
   stopPoll()
   currentExec.value = null
   promptCopied.value = false
+  promptDraft.value = ''
   logTail.value = ''
 }
 
@@ -380,7 +411,7 @@ onMounted(() => {
     <header class="head">
       <div>
         <p class="kicker">WISHLIST</p>
-        <h2>願望清單</h2>
+        <h2>願望清單Ya</h2>
         <p class="sub" v-if="isAdmin">你是管理者 — 可以勾選願望、產 prompt 給 Claude 執行</p>
         <p class="sub" v-else>提你想要的功能 / 想改的子專案，管理者會挑選實作</p>
       </div>
@@ -511,11 +542,37 @@ onMounted(() => {
           <div>
             <p class="kicker">EXECUTION · #{{ currentExec.id }}</p>
             <h3>給 Claude 的 prompt</h3>
-            <p class="sub">由本地模型產出，請先過目；確認 OK 後複製給 Claude Code 執行</p>
+            <p class="sub">由本地模型產出。這份內容會原樣送進 server 上的 claude 執行 — 請對照原文後再確認</p>
           </div>
           <button class="close" @click="closeExec">✕</button>
         </header>
-        <pre class="prompt"><code>{{ currentExec.generated_prompt }}</code></pre>
+
+        <!-- 使用者原文。gemma 只是轉述，夾帶指令的話源頭在這裡，所以要能對照 -->
+        <div v-if="currentExec.sources && currentExec.sources.length" class="sources">
+          <button class="sources-toggle" @click="showSources = !showSources">
+            <span class="caret">{{ showSources ? '▾' : '▸' }}</span>
+            使用者原文（{{ currentExec.sources.length }} 條）
+            <span class="sources-hint">— 確認下方 prompt 沒有多出原文以外的指令</span>
+          </button>
+          <ul v-if="showSources" class="source-list">
+            <li v-for="src in currentExec.sources" :key="src.id">
+              <p class="source-head">#{{ src.id }} · @{{ src.by }} — {{ src.title }}</p>
+              <p class="source-desc">{{ src.description || '(無說明)' }}</p>
+            </li>
+          </ul>
+        </div>
+
+        <textarea
+          v-if="currentExec.status === 'draft'"
+          v-model="promptDraft"
+          class="prompt prompt-edit"
+          spellcheck="false"
+        ></textarea>
+        <pre v-else class="prompt"><code>{{ currentExec.generated_prompt }}</code></pre>
+
+        <p v-if="currentExec.status === 'draft'" class="edit-hint">
+          ✎ 可直接編輯 — 送出的是你看到的這份，不是 gemma 的原始輸出。
+        </p>
 
         <div v-if="currentExec.status === 'approved'" class="approved-hint">
           ✓ 已確認 — 按下方「由 Claude 完成」直接讓 server 上的 claude -p 自動跑，或自己複製 prompt 貼到別的 Claude Code 視窗。
@@ -767,6 +824,65 @@ h2 { margin: 0; font-weight: 600; letter-spacing: .5px; }
   color: var(--tx-1);
   font: 13px/1.6 ui-monospace, "JetBrains Mono", Menlo, monospace;
   white-space: pre-wrap;
+}
+.prompt-edit {
+  width: 100%;
+  min-height: 260px;
+  border: 0;
+  border-top: 1px solid var(--line-1);
+  border-bottom: 1px solid var(--line-1);
+  resize: vertical;
+  box-sizing: border-box;
+}
+.prompt-edit:focus {
+  outline: none;
+  background: #101010;
+}
+.edit-hint {
+  margin: 0;
+  padding: 10px 22px;
+  font-size: 12px;
+  color: var(--tx-2, #9a9a9a);
+}
+.sources {
+  border-top: 1px solid var(--line-1);
+  background: rgba(255, 255, 255, .025);
+  flex-shrink: 0;
+  max-height: 34vh;
+  overflow: auto;
+}
+.sources-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 11px 22px;
+  background: none;
+  border: 0;
+  color: var(--tx-1, #eee);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.sources-toggle:hover { background: rgba(255, 255, 255, .04); }
+.caret { display: inline-block; width: 12px; color: var(--tx-2, #9a9a9a); }
+.sources-hint { color: var(--tx-2, #9a9a9a); font-size: 12px; }
+.source-list {
+  margin: 0;
+  padding: 0 22px 14px 46px;
+  list-style: none;
+}
+.source-list li + li { margin-top: 12px; }
+.source-head {
+  margin: 0 0 3px;
+  font-size: 12.5px;
+  color: var(--tx-2, #9a9a9a);
+}
+.source-desc {
+  margin: 0;
+  font: 12.5px/1.6 ui-monospace, "JetBrains Mono", Menlo, monospace;
+  color: var(--tx-1, #eee);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .approved-hint,
 .running-hint,
